@@ -157,32 +157,45 @@ class RedisFacade {
         return is_array($res) ? $res : [];
     }
 
-    public function scan($cursor, $pattern = '*', $count = 200) {
-        if ($this->isNative) {
-            $keys = [];
-            $this->r->setOption(Redis::OPT_SCAN, Redis::SCAN_RETRY);
-            $res = $this->r->scan($cursor, $pattern, $count);
-            if ($res === false) return [0, []];
-            return [$cursor, is_array($res) ? $res : []];
-        }
-        $args = [$cursor, 'MATCH', $pattern, 'COUNT', $count];
-        $res = $this->r->cmd('SCAN', ...$args);
-        if (!is_array($res)) return [0, []];
-        return [(int)$res[0], is_array($res[1]) ? $res[1] : []];
-    }
-
     public function scanAll($pattern = '*', $count = 500) {
-        $all = []; $cursor = 0;
+        $all = [];
+        if ($this->isNative) {
+            // phpredis requires $it to start as NULL; passing 0 causes it to
+            // return false immediately (treating 0 as "iteration complete").
+            $it = null;
+            $this->r->setOption(Redis::OPT_SCAN, Redis::SCAN_RETRY);
+            while (($keys = $this->r->scan($it, $pattern, $count)) !== false) {
+                if (is_array($keys)) $all = array_merge($all, $keys);
+            }
+            return $all;
+        }
+        // Raw TCP SCAN loop
+        $cursor = 0;
         do {
-            [$cursor, $keys] = $this->scan($cursor, $pattern, $count);
-            $all = array_merge($all, $keys);
-        } while ($cursor != 0);
+            $res = $this->r->cmd('SCAN', (string)$cursor, 'MATCH', $pattern, 'COUNT', (string)$count);
+            if (!is_array($res) || count($res) < 2) break;
+            $cursor = (int)$res[0];
+            if (is_array($res[1])) $all = array_merge($all, $res[1]);
+        } while ($cursor !== 0);
         return $all;
     }
 
     public function type($key) {
-        $t = $this->call('TYPE', $key);
-        return is_string($t) ? $t : (string)$t;
+        if ($this->isNative) {
+            // phpredis returns integer constants, NOT strings like the raw protocol does
+            static $map = null;
+            if ($map === null) $map = [
+                Redis::REDIS_STRING => 'string',
+                Redis::REDIS_LIST   => 'list',
+                Redis::REDIS_SET    => 'set',
+                Redis::REDIS_ZSET   => 'zset',
+                Redis::REDIS_HASH   => 'hash',
+            ];
+            $t = $this->r->type($key);
+            return $map[$t] ?? 'none';
+        }
+        $t = $this->r->cmd('TYPE', $key);
+        return is_string($t) ? $t : 'none';
     }
 
     public function ttl($key) { return $this->call('TTL', $key); }
@@ -206,7 +219,12 @@ class RedisFacade {
 
     // Hash
     public function hgetall($key) {
-        $res = $this->call('HGETALL', $key);
+        if ($this->isNative) {
+            // phpredis returns ['field' => 'value', ...] directly — not a flat array
+            $res = $this->r->hgetall($key);
+            return is_array($res) ? $res : [];
+        }
+        $res = $this->r->cmd('HGETALL', $key);
         if (!is_array($res)) return [];
         $out = [];
         for ($i = 0; $i < count($res); $i += 2) $out[$res[$i]] = $res[$i+1] ?? '';
@@ -216,7 +234,17 @@ class RedisFacade {
     public function hdel($key, $field) { return $this->call('HDEL', $key, $field); }
     public function hlen($key) { return $this->call('HLEN', $key); }
     public function hscan($key, $cursor, $pattern = '*', $count = 100) {
-        $res = $this->call('HSCAN', $key, $cursor, 'MATCH', $pattern, 'COUNT', $count);
+        if ($this->isNative) {
+            // phpredis hscan: $it by reference, returns ['field'=>'val'] assoc or false
+            $it = null;
+            $this->r->setOption(Redis::OPT_SCAN, Redis::SCAN_RETRY);
+            $out = [];
+            while (($fields = $this->r->hscan($key, $it, $pattern, $count)) !== false) {
+                if (is_array($fields)) $out = array_merge($out, $fields);
+            }
+            return [0, $out];
+        }
+        $res = $this->r->cmd('HSCAN', $key, (string)$cursor, 'MATCH', $pattern, 'COUNT', (string)$count);
         if (!is_array($res)) return [0, []];
         $fields = is_array($res[1]) ? $res[1] : [];
         $out = [];
@@ -244,14 +272,31 @@ class RedisFacade {
     public function sadd($key, $member) { return $this->call('SADD', $key, $member); }
     public function srem($key, $member) { return $this->call('SREM', $key, $member); }
     public function sscan($key, $cursor, $pattern = '*', $count = 100) {
-        $res = $this->call('SSCAN', $key, $cursor, 'MATCH', $pattern, 'COUNT', $count);
+        if ($this->isNative) {
+            $it = null;
+            $this->r->setOption(Redis::OPT_SCAN, Redis::SCAN_RETRY);
+            $out = [];
+            while (($members = $this->r->sscan($key, $it, $pattern, $count)) !== false) {
+                if (is_array($members)) $out = array_merge($out, array_values($members));
+            }
+            return [0, $out];
+        }
+        $res = $this->r->cmd('SSCAN', $key, (string)$cursor, 'MATCH', $pattern, 'COUNT', (string)$count);
         if (!is_array($res)) return [0, []];
         return [(int)$res[0], is_array($res[1]) ? $res[1] : []];
     }
 
     // ZSet
     public function zrangewithscores($key, $s, $e) {
-        $res = $this->call('ZRANGE', $key, $s, $e, 'WITHSCORES');
+        if ($this->isNative) {
+            // phpredis zrange(..., true) returns ['member' => score] assoc, not a flat array
+            $res = $this->r->zrange($key, $s, $e, true);
+            if (!is_array($res)) return [];
+            $out = [];
+            foreach ($res as $member => $score) $out[] = ['member' => $member, 'score' => $score];
+            return $out;
+        }
+        $res = $this->r->cmd('ZRANGE', $key, (string)$s, (string)$e, 'WITHSCORES');
         if (!is_array($res)) return [];
         $out = [];
         for ($i = 0; $i < count($res); $i += 2) $out[] = ['member' => $res[$i], 'score' => $res[$i+1] ?? 0];
@@ -269,7 +314,12 @@ class RedisFacade {
     }
 
     public function configGet($pattern) {
-        $res = $this->call('CONFIG', 'GET', $pattern);
+        if ($this->isNative) {
+            // phpredis config('GET', ...) returns ['key' => 'value'] assoc directly
+            $res = $this->r->config('GET', $pattern);
+            return is_array($res) ? $res : [];
+        }
+        $res = $this->r->cmd('CONFIG', 'GET', $pattern);
         if (!is_array($res)) return [];
         $out = [];
         for ($i = 0; $i < count($res); $i += 2) $out[$res[$i]] = $res[$i+1] ?? '';
@@ -281,7 +331,22 @@ class RedisFacade {
     }
 
     public function clientList() {
-        return $this->call('CLIENT', 'LIST');
+        $res = $this->call('CLIENT', 'LIST');
+        // Normalize: phpredis can return a string or an array depending on version
+        if (is_array($res)) {
+            $lines = [];
+            foreach ($res as $client) {
+                if (is_array($client)) {
+                    $pairs = [];
+                    foreach ($client as $k => $v) $pairs[] = "$k=$v";
+                    $lines[] = implode(' ', $pairs);
+                } else {
+                    $lines[] = (string)$client;
+                }
+            }
+            return implode("\n", $lines);
+        }
+        return is_string($res) ? $res : '';
     }
 }
 
@@ -824,6 +889,22 @@ select option { background: var(--bg3); }
 
 .key-ttl { font-size: 10px; color: var(--text3); white-space: nowrap; flex-shrink: 0; }
 .key-ttl.expiring { color: var(--yellow); }
+
+/* ── Prefix Tree ── */
+.key-group { border-bottom: 1px solid rgba(255,255,255,.02); }
+.key-group-header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 12px; cursor: pointer;
+  transition: background .1s; user-select: none;
+}
+.key-group-header:hover { background: var(--bg3); }
+.key-group-arrow { font-size: 9px; color: var(--text3); width: 12px; flex-shrink: 0; transition: transform .15s; }
+.key-group-icon { font-size: 12px; flex-shrink: 0; }
+.key-group-name { flex: 1; font-size: 12px; color: var(--text2); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.key-group-name strong { color: var(--text); font-weight: 600; }
+.key-group-count { font-size: 10px; background: var(--bg5); color: var(--text3); padding: 1px 7px; border-radius: 10px; flex-shrink: 0; }
+.key-group-items .key-item { padding-left: 32px; }
+.key-group-items .key-item.selected { border-left: 2px solid var(--accent); padding-left: 30px; }
 
 .keys-footer {
   padding: 8px 12px; border-top: 1px solid var(--border);
@@ -1548,6 +1629,7 @@ const S = {
   selectedKey: null, keyData: null,
   cliHistory: [], cliHistoryIdx: -1,
   currentDb: <?= (int)($conn['db'] ?? 0) ?>,
+  expandedGroups: new Set(),   // prefix groups toggled open by the user
 };
 
 // ─── API ─────────────────────────────────────────────────────────────────────
@@ -1618,6 +1700,72 @@ async function loadKeys(page) {
   updateTopbarDbSize();
 }
 
+// ─── Prefix Tree ─────────────────────────────────────────────────────────────
+
+function detectSeparator(keys) {
+  // Count occurrences of each candidate separator
+  const seps = [':', '/', '.', '-', '|'];
+  const counts = {};
+  for (const sep of seps) counts[sep] = 0;
+  for (const k of keys) {
+    for (const sep of seps) { if (k.key.includes(sep)) counts[sep]++; }
+  }
+  const best = seps.reduce((a, b) => counts[a] >= counts[b] ? a : b);
+  // Only use grouping if at least 25% of keys share this separator
+  return counts[best] >= Math.max(2, keys.length * 0.25) ? best : null;
+}
+
+function buildPrefixGroups(keys) {
+  const sep = detectSeparator(keys);
+  if (!sep) return { sep: null, groups: {}, ungrouped: keys };
+  const groups = {};
+  const ungrouped = [];
+  for (const k of keys) {
+    const idx = k.key.indexOf(sep);
+    if (idx > 0) {
+      const prefix = k.key.slice(0, idx + 1); // e.g. "user:"
+      if (!groups[prefix]) groups[prefix] = [];
+      groups[prefix].push(k);
+    } else {
+      ungrouped.push(k);
+    }
+  }
+  // Dissolve single-key groups back to ungrouped (no point grouping 1 key)
+  for (const [prefix, ks] of Object.entries(groups)) {
+    if (ks.length < 2) { ungrouped.push(...ks); delete groups[prefix]; }
+  }
+  return { sep, groups, ungrouped };
+}
+
+function toggleGroup(prefix) {
+  if (S.expandedGroups.has(prefix)) S.expandedGroups.delete(prefix);
+  else S.expandedGroups.add(prefix);
+  const header = document.querySelector(`.key-group-header[data-prefix="${CSS.escape(prefix)}"]`);
+  if (!header) return;
+  const items = header.nextElementSibling;
+  const arrow = header.querySelector('.key-group-arrow');
+  const expanded = S.expandedGroups.has(prefix);
+  items.style.display = expanded ? '' : 'none';
+  arrow.textContent = expanded ? '▼' : '▶';
+}
+
+function renderKeyItem(k, prefix = '') {
+  const isSelected = S.selectedKey === k.key;
+  // Show only the portion after the prefix when inside a group
+  const displayName = prefix && k.key.startsWith(prefix) ? k.key.slice(prefix.length) : k.key;
+  const srch = (document.getElementById('keySearch')?.value || '').replace(/[*?]/g, '');
+  let nameHtml = srch
+    ? e(displayName).replace(new RegExp('(' + escRx(srch) + ')', 'gi'), '<mark>$1</mark>')
+    : e(displayName);
+  const ttlStr = k.ttl < 0 ? '' : k.ttl < 60 ? k.ttl + 's' : k.ttl < 3600 ? Math.floor(k.ttl/60) + 'm' : k.ttl < 86400 ? Math.floor(k.ttl/3600) + 'h' : Math.floor(k.ttl/86400) + 'd';
+  const ttlClass = k.ttl > 0 && k.ttl < 60 ? ' expiring' : '';
+  return `<div class="key-item${isSelected ? ' selected' : ''}" data-key="${e(k.key)}" onclick="selectKey('${esc(k.key)}')">
+    <span class="type-badge type-${e(k.type)}">${e(k.type)}</span>
+    <span class="key-name" title="${e(k.key)}">${nameHtml}</span>
+    ${ttlStr ? `<span class="key-ttl${ttlClass}">${ttlStr}</span>` : ''}
+  </div>`;
+}
+
 function renderKeys(keys, total, page, perPage) {
   const list = document.getElementById('keysList');
   if (!keys.length) {
@@ -1626,20 +1774,43 @@ function renderKeys(keys, total, page, perPage) {
     document.getElementById('pagination').innerHTML = '';
     return;
   }
-  const srch = document.getElementById('keySearch').value.replace(/[*?]/g,'');
-  list.innerHTML = keys.map(k => {
-    const isSelected = S.selectedKey === k.key;
-    const name = srch ? k.key.replace(new RegExp('('+escRx(srch)+')','gi'), '<mark>$1</mark>') : e(k.key);
-    const ttlStr = k.ttl < 0 ? '' : (k.ttl < 60 ? k.ttl+'s' : k.ttl < 3600 ? Math.floor(k.ttl/60)+'m' : k.ttl < 86400 ? Math.floor(k.ttl/3600)+'h' : Math.floor(k.ttl/86400)+'d');
-    const ttlClass = k.ttl > 0 && k.ttl < 60 ? ' expiring' : '';
-    return `<div class="key-item${isSelected?' selected':''}" onclick="selectKey('${esc(k.key)}')">
-      <span class="type-badge type-${e(k.type)}">${e(k.type)}</span>
-      <span class="key-name" title="${e(k.key)}">${name}</span>
-      ${ttlStr ? `<span class="key-ttl${ttlClass}">${ttlStr}</span>` : ''}
-    </div>`;
-  }).join('');
 
-  document.getElementById('keysCount').textContent = `${total.toLocaleString()} key${total!==1?'s':''}`;
+  const { sep, groups, ungrouped } = buildPrefixGroups(keys);
+  let html = '';
+
+  // Ungrouped keys first
+  for (const k of ungrouped) html += renderKeyItem(k);
+
+  // Grouped keys
+  const sortedGroups = Object.entries(groups).sort(([a], [b]) => a.localeCompare(b));
+  for (const [prefix, groupKeys] of sortedGroups) {
+    // Auto-expand small groups or groups containing the selected key, or if user toggled it
+    const hasSelected = groupKeys.some(k => k.key === S.selectedKey);
+    const autoExpand = groupKeys.length <= 4 || hasSelected;
+    const isExpanded = S.expandedGroups.has(prefix) ? true : (!S.expandedGroups.has('__collapsed__' + prefix) && autoExpand);
+    const arrow = isExpanded ? '▼' : '▶';
+
+    // Show most common sub-type in the group
+    const typeCounts = {};
+    groupKeys.forEach(k => { typeCounts[k.type] = (typeCounts[k.type]||0)+1; });
+    const dominantType = Object.entries(typeCounts).sort((a,b) => b[1]-a[1])[0]?.[0] || '';
+
+    html += `<div class="key-group">
+      <div class="key-group-header" data-prefix="${e(prefix)}" onclick="toggleGroup('${esc(prefix)}')">
+        <span class="key-group-arrow">${arrow}</span>
+        <span class="key-group-icon">📁</span>
+        <span class="key-group-name"><strong>${e(prefix)}</strong></span>
+        ${dominantType ? `<span class="type-badge type-${e(dominantType)}" style="font-size:8px">${e(dominantType)}</span>` : ''}
+        <span class="key-group-count">${groupKeys.length}</span>
+      </div>
+      <div class="key-group-items" ${isExpanded ? '' : 'style="display:none"'}>
+        ${groupKeys.map(k => renderKeyItem(k, prefix)).join('')}
+      </div>
+    </div>`;
+  }
+
+  list.innerHTML = html;
+  document.getElementById('keysCount').textContent = `${total.toLocaleString()} key${total !== 1 ? 's' : ''}`;
   renderPagination(total, page, perPage);
 }
 
@@ -1673,15 +1844,9 @@ function setTypeFilter(el, type) {
 // ─── Key Selection / Detail ──────────────────────────────────────────────────
 async function selectKey(key) {
   S.selectedKey = key;
-  // Highlight
+  // Highlight using the data-key attribute set on each .key-item
   document.querySelectorAll('.key-item').forEach(el => {
-    el.classList.toggle('selected', el.querySelector('.key-name')?.title === key || el.onclick?.toString().includes(`'${key}'`));
-  });
-  // Re-render list selection
-  document.querySelectorAll('.key-item').forEach(el => {
-    const nameEl = el.querySelector('.key-name');
-    if (nameEl && nameEl.title === key) el.classList.add('selected');
-    else el.classList.remove('selected');
+    el.classList.toggle('selected', el.dataset.key === key);
   });
 
   const panel = document.getElementById('detailPanel');
@@ -1720,9 +1885,9 @@ function renderDetail(d) {
         </div>
       </div>
       <div class="detail-actions">
-        <button class="btn btn-secondary btn-sm" onclick="openTtlModal('${esc(d.key)}',${d.ttl})" title="Edit TTL">⏱ TTL</button>
-        <button class="btn btn-secondary btn-sm" onclick="openRenameModal('${esc(d.key)}')" title="Rename">✏ Rename</button>
-        <button class="btn btn-danger btn-sm" onclick="deleteKey('${esc(d.key)}')" title="Delete">🗑 Delete</button>
+        <button class="btn btn-secondary btn-sm" data-action="edit-ttl" title="Edit TTL">⏱ TTL</button>
+        <button class="btn btn-secondary btn-sm" data-action="rename-key" title="Rename">✏ Rename</button>
+        <button class="btn btn-danger btn-sm" data-action="delete-key" title="Delete">🗑 Delete</button>
       </div>
     </div>
     <div class="detail-body">${valueHtml}</div>`;
@@ -1731,19 +1896,20 @@ function renderDetail(d) {
 function renderString(d) {
   const val = d.value ?? '';
   let prettyJson = '';
-  try { prettyJson = syntaxHighlight(JSON.stringify(JSON.parse(val), null, 2)); } catch(e) {}
+  try { prettyJson = syntaxHighlight(JSON.stringify(JSON.parse(val), null, 2)); } catch(ex) {}
   return `<div class="value-string-wrap">
     <div class="section-hdr">
       <h3>String Value</h3>
       <span class="section-count">${typeof d.count === 'number' ? d.count + ' bytes' : ''}</span>
-      <button class="btn btn-secondary btn-sm" style="margin-left:auto" onclick="openStringEdit('${esc(d.key)}','${esc(val)}',${d.ttl})">✏ Edit</button>
+      <button class="btn btn-secondary btn-sm" style="margin-left:auto" data-action="edit-string">✏ Edit</button>
     </div>
-    ${prettyJson ? `<div style="display:flex;gap:8px;margin-bottom:8px">
-      <button class="btn btn-ghost btn-xs" onclick="toggleJsonView(this)">JSON View</button>
-    </div>
-    <div class="string-value-box json-hidden">${e(val)}</div>
-    <div class="string-value-box json-view" style="display:none">${prettyJson}</div>` :
-    `<div class="string-value-box">${e(val)}</div>`}
+    ${prettyJson
+      ? `<div style="display:flex;gap:8px;margin-bottom:8px">
+           <button class="btn btn-ghost btn-xs" data-action="toggle-json">JSON View</button>
+         </div>
+         <div class="string-value-box json-hidden">${e(val)}</div>
+         <div class="string-value-box json-view" style="display:none">${prettyJson}</div>`
+      : `<div class="string-value-box">${e(val)}</div>`}
   </div>`;
 }
 
@@ -1764,16 +1930,16 @@ function renderHash(d) {
     <div class="section-hdr">
       <h3>Hash Fields</h3>
       <span class="section-count">${d.count} fields</span>
-      <button class="btn btn-secondary btn-sm" style="margin-left:auto" onclick="openAddHashField('${esc(d.key)}')">＋ Add Field</button>
+      <button class="btn btn-secondary btn-sm" style="margin-left:auto" data-action="add-hash-field">＋ Add Field</button>
     </div>
     <div class="value-table-wrap"><table class="value-table">
       <thead><tr><th>Field</th><th>Value</th><th></th></tr></thead>
-      <tbody>${entries.map(([f,v]) => `<tr>
+      <tbody>${entries.map(([f, v]) => `<tr>
         <td class="cell-key">${e(f)}</td>
         <td class="cell-val">${renderCellVal(v)}</td>
         <td class="cell-act">
-          <button class="btn btn-ghost btn-xs" onclick="openEditHashField('${esc(d.key)}','${esc(f)}','${esc(v)}')">✏</button>
-          <button class="btn btn-danger btn-xs" onclick="deleteHashField('${esc(d.key)}','${esc(f)}')">✕</button>
+          <button class="btn btn-ghost btn-xs" data-action="edit-hash-field" data-field="${e(f)}">✏</button>
+          <button class="btn btn-danger btn-xs" data-action="del-hash-field" data-field="${e(f)}">✕</button>
         </td>
       </tr>`).join('')}</tbody>
     </table></div>
@@ -1786,15 +1952,15 @@ function renderList(d) {
     <div class="section-hdr">
       <h3>List Items</h3>
       <span class="section-count">${d.count} items</span>
-      <button class="btn btn-secondary btn-sm" style="margin-left:auto" onclick="openAddListItem('${esc(d.key)}')">＋ Push Item</button>
+      <button class="btn btn-secondary btn-sm" style="margin-left:auto" data-action="add-list-item">＋ Push Item</button>
     </div>
     <div class="value-table-wrap"><table class="value-table">
       <thead><tr><th>#</th><th>Value</th><th></th></tr></thead>
-      <tbody>${items.map((v,i) => `<tr>
+      <tbody>${items.map((v, i) => `<tr>
         <td class="cell-idx">${i}</td>
         <td class="cell-val">${renderCellVal(v)}</td>
         <td class="cell-act">
-          <button class="btn btn-danger btn-xs" onclick="deleteListItem('${esc(d.key)}','${esc(v)}')">✕</button>
+          <button class="btn btn-danger btn-xs" data-action="del-list-item" data-index="${i}">✕</button>
         </td>
       </tr>`).join('')}</tbody>
     </table></div>
@@ -1807,14 +1973,14 @@ function renderSet(d) {
     <div class="section-hdr">
       <h3>Set Members</h3>
       <span class="section-count">${d.count} members</span>
-      <button class="btn btn-secondary btn-sm" style="margin-left:auto" onclick="openAddSetMember('${esc(d.key)}')">＋ Add Member</button>
+      <button class="btn btn-secondary btn-sm" style="margin-left:auto" data-action="add-set-member">＋ Add Member</button>
     </div>
     <div class="value-table-wrap"><table class="value-table">
       <thead><tr><th>Member</th><th></th></tr></thead>
-      <tbody>${members.map(v => `<tr>
+      <tbody>${members.map((v, i) => `<tr>
         <td class="cell-val">${renderCellVal(v)}</td>
         <td class="cell-act">
-          <button class="btn btn-danger btn-xs" onclick="deleteSetMember('${esc(d.key)}','${esc(v)}')">✕</button>
+          <button class="btn btn-danger btn-xs" data-action="del-set-member" data-index="${i}">✕</button>
         </td>
       </tr>`).join('')}</tbody>
     </table></div>
@@ -1827,15 +1993,15 @@ function renderZset(d) {
     <div class="section-hdr">
       <h3>Sorted Set Members</h3>
       <span class="section-count">${d.count} members</span>
-      <button class="btn btn-secondary btn-sm" style="margin-left:auto" onclick="openAddZsetMember('${esc(d.key)}')">＋ Add Member</button>
+      <button class="btn btn-secondary btn-sm" style="margin-left:auto" data-action="add-zset-member">＋ Add Member</button>
     </div>
     <div class="value-table-wrap"><table class="value-table">
       <thead><tr><th>Score</th><th>Member</th><th></th></tr></thead>
-      <tbody>${items.map(m => `<tr>
+      <tbody>${items.map((m, i) => `<tr>
         <td class="cell-score">${m.score}</td>
         <td class="cell-val">${renderCellVal(m.member)}</td>
         <td class="cell-act">
-          <button class="btn btn-danger btn-xs" onclick="deleteZsetMember('${esc(d.key)}','${esc(m.member)}')">✕</button>
+          <button class="btn btn-danger btn-xs" data-action="del-zset-member" data-index="${i}">✕</button>
         </td>
       </tr>`).join('')}</tbody>
     </table></div>
@@ -1865,12 +2031,90 @@ function formatBytes(b) {
   return (b/1048576).toFixed(2) + ' MB';
 }
 
+// ─── Detail Panel — Event Delegation ─────────────────────────────────────────
+// All buttons inside #detailPanel use data-action so that values with special
+// characters (newlines, quotes, etc.) are read from S.keyData, not from inline
+// onclick strings.
+
+document.addEventListener('click', async ev => {
+  const btn = ev.target.closest('[data-action]');
+  if (!btn) return;
+  const action = btn.dataset.action;
+  const d = S.keyData;
+
+  // Actions that don't need keyData
+  if (action === 'toggle-json') { toggleJsonView(btn); return; }
+  if (action === 'edit-string') { openStringEditCurrent(); return; }
+
+  // All others need the current key context
+  if (!d) return;
+
+  switch (action) {
+    // ── Detail header ──
+    case 'edit-ttl':    openTtlModal(d.key, d.ttl); break;
+    case 'rename-key':  openRenameModal(d.key); break;
+    case 'delete-key':  deleteKey(d.key); break;
+
+    // ── Hash ──
+    case 'add-hash-field': openAddHashField(d.key); break;
+    case 'edit-hash-field': {
+      const field = btn.dataset.field;
+      const val = (d.value || {})[field] ?? '';
+      openEditHashField(d.key, field, val);
+      break;
+    }
+    case 'del-hash-field': {
+      const field = btn.dataset.field;
+      if (!confirm(`Delete field "${field}"?`)) return;
+      const r = await api('delete_hash_field', { key: d.key, field });
+      if (r.ok) { toast('Field deleted'); selectKey(d.key); } else toast('Failed', 'error');
+      break;
+    }
+
+    // ── List ──
+    case 'add-list-item': openAddListItem(d.key); break;
+    case 'del-list-item': {
+      const idx = parseInt(btn.dataset.index);
+      const val = (d.value || [])[idx];
+      if (val === undefined) return;
+      const r = await api('delete_list_item', { key: d.key, value: val });
+      if (r.ok) { toast('Item removed'); selectKey(d.key); } else toast('Failed', 'error');
+      break;
+    }
+
+    // ── Set ──
+    case 'add-set-member': openAddSetMember(d.key); break;
+    case 'del-set-member': {
+      const member = (d.value || [])[parseInt(btn.dataset.index)];
+      if (member === undefined) return;
+      const r = await api('delete_set_member', { key: d.key, member });
+      if (r.ok) { toast('Member removed'); selectKey(d.key); } else toast('Failed', 'error');
+      break;
+    }
+
+    // ── ZSet ──
+    case 'add-zset-member': openAddZsetMember(d.key); break;
+    case 'del-zset-member': {
+      const item = (d.value || [])[parseInt(btn.dataset.index)];
+      if (!item) return;
+      const r = await api('delete_zset_member', { key: d.key, member: item.member });
+      if (r.ok) { toast('Member removed'); selectKey(d.key); } else toast('Failed', 'error');
+      break;
+    }
+  }
+});
+
 // ─── Key Actions ─────────────────────────────────────────────────────────────
 async function deleteKey(key) {
   if (!confirm(`Delete key: ${key}?`)) return;
   const res = await api('delete_key', { key });
-  if (res.ok) { toast('Key deleted'); S.selectedKey = null; document.getElementById('detailPanel').innerHTML = `<div class="detail-empty"><div class="empty-icon">🔑</div><p>Select a key to view its value</p></div>`; loadKeys(S.page); }
-  else toast(res.error, 'error');
+  if (res.ok) {
+    toast('Key deleted');
+    S.selectedKey = null;
+    S.keyData = null;
+    document.getElementById('detailPanel').innerHTML = `<div class="detail-empty"><div class="empty-icon">🔑</div><p>Select a key to view its value</p></div>`;
+    loadKeys(S.page);
+  } else toast(res.error, 'error');
 }
 
 function openTtlModal(key, ttl) {
@@ -1905,6 +2149,17 @@ async function doRename() {
   else toast(res.error || 'Rename failed', 'error');
 }
 
+function openStringEditCurrent() {
+  const d = S.keyData;
+  if (!d || d.type !== 'string') return;
+  document.getElementById('editStringKey').textContent = d.key;
+  document.getElementById('editStringVal').value = d.value ?? '';
+  document.getElementById('editStringTtl').value = d.ttl;
+  document.getElementById('editStringModal').setAttribute('data-key', d.key);
+  openModal('editStringModal');
+}
+
+// Keep openStringEdit as an alias for any future direct calls
 function openStringEdit(key, val, ttl) {
   document.getElementById('editStringKey').textContent = key;
   document.getElementById('editStringVal').value = val;
@@ -1922,7 +2177,7 @@ async function saveStringEdit() {
   else toast('Save failed', 'error');
 }
 
-// Hash
+// Hash modal openers (delegation calls these for edit/add)
 function openAddHashField(key) {
   document.getElementById('addHashKey').value = key;
   document.getElementById('addHashField').value = '';
@@ -1952,13 +2207,9 @@ async function saveHashEdit() {
   if (res.ok) { toast('Field updated'); closeModal('editHashFieldModal'); selectKey(key); }
   else toast('Failed', 'error');
 }
-async function deleteHashField(key, field) {
-  if (!confirm(`Delete field "${field}"?`)) return;
-  const res = await api('delete_hash_field', { key, field });
-  if (res.ok) { toast('Field deleted'); selectKey(key); } else toast('Failed', 'error');
-}
+// (hash field deletion is now handled by the detail-panel event delegation above)
 
-// List
+// List modal openers
 function openAddListItem(key) {
   document.getElementById('addListKey').value = key;
   document.getElementById('addListValue').value = '';
@@ -1972,12 +2223,7 @@ async function saveListItem() {
   if (res.ok) { toast('Item pushed'); closeModal('addListItemModal'); selectKey(key); }
   else toast('Failed', 'error');
 }
-async function deleteListItem(key, value) {
-  const res = await api('delete_list_item', { key, value });
-  if (res.ok) { toast('Item removed'); selectKey(key); } else toast('Failed', 'error');
-}
-
-// Set
+// Set modal openers
 function openAddSetMember(key) {
   document.getElementById('addSetKey').value = key;
   document.getElementById('addSetMember').value = '';
@@ -1990,12 +2236,7 @@ async function saveSetMember() {
   if (res.ok) { toast('Member added'); closeModal('addSetMemberModal'); selectKey(key); }
   else toast('Failed', 'error');
 }
-async function deleteSetMember(key, member) {
-  const res = await api('delete_set_member', { key, member });
-  if (res.ok) { toast('Member removed'); selectKey(key); } else toast('Failed', 'error');
-}
-
-// ZSet
+// ZSet modal openers
 function openAddZsetMember(key) {
   document.getElementById('addZsetKey').value = key;
   document.getElementById('addZsetScore').value = 0;
@@ -2010,11 +2251,6 @@ async function saveZsetMember() {
   if (res.ok) { toast('Member added'); closeModal('addZsetMemberModal'); selectKey(key); }
   else toast('Failed', 'error');
 }
-async function deleteZsetMember(key, member) {
-  const res = await api('delete_zset_member', { key, member });
-  if (res.ok) { toast('Member removed'); selectKey(key); } else toast('Failed', 'error');
-}
-
 // ─── Add New Key ─────────────────────────────────────────────────────────────
 let newKeyType = 'string';
 function setNewKeyType(el, type) {
@@ -2233,64 +2469,101 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // ─── Clients ─────────────────────────────────────────────────────────────────
 async function loadClients() {
-  document.getElementById('clientsContent').innerHTML = `<div class="loading-overlay"><div class="spinner"></div></div>`;
-  const res = await api('client_list');
-  if (!res.ok) { document.getElementById('clientsContent').innerHTML = `<div style="color:var(--red)">Error</div>`; return; }
-  const raw = res.clients || '';
-  const clients = raw.split('\n').filter(Boolean).map(line => {
-    const obj = {};
-    line.split(' ').forEach(pair => { const [k,v] = pair.split('=',2); if(k) obj[k]=v; });
-    return obj;
-  });
-  document.getElementById('clientsContent').innerHTML = `
-    <div class="value-table-wrap" style="margin-top:12px">
-      <table class="value-table">
-        <thead><tr><th>id</th><th>addr</th><th>cmd</th><th>age</th><th>idle</th><th>flags</th><th>db</th><th>mem</th></tr></thead>
-        <tbody>${clients.map(c => `<tr>
-          <td>${c.id||'—'}</td><td style="color:var(--cyan)">${c.addr||'—'}</td>
-          <td style="color:var(--accent)">${c.cmd||'—'}</td><td>${c.age||0}s</td>
-          <td>${c.idle||0}s</td><td>${c.flags||'—'}</td><td>${c.db||0}</td>
-          <td>${formatBytes(parseInt(c.tot_mem||c.rbs||0))}</td>
-        </tr>`).join('')}</tbody>
-      </table>
-    </div>`;
+  const el = document.getElementById('clientsContent');
+  el.innerHTML = `<div class="loading-overlay"><div class="spinner"></div></div>`;
+  try {
+    const res = await api('client_list');
+    if (!res.ok) { el.innerHTML = `<div style="color:var(--red);padding:16px">Error: ${e(res.error||'Unknown')}</div>`; return; }
+
+    // res.clients is always a string after the PHP fix, but guard anyway
+    const raw = typeof res.clients === 'string' ? res.clients : '';
+    if (!raw.trim()) {
+      el.innerHTML = `<div style="color:var(--text3);padding:16px">No clients connected.</div>`; return;
+    }
+
+    const clients = raw.split('\n').filter(Boolean).map(line => {
+      const obj = {};
+      // CLIENT LIST lines look like: id=6 addr=127.0.0.1:54320 laddr=... fd=8 name= age=0 idle=0 flags=N db=0 ...
+      line.split(' ').forEach(pair => {
+        const eq = pair.indexOf('=');
+        if (eq > 0) obj[pair.slice(0, eq)] = pair.slice(eq + 1);
+      });
+      return obj;
+    });
+
+    el.innerHTML = `
+      <div style="color:var(--text2);font-size:11px;margin-bottom:10px">${clients.length} client${clients.length !== 1 ? 's' : ''} connected</div>
+      <div class="value-table-wrap">
+        <table class="value-table">
+          <thead><tr><th>id</th><th>addr</th><th>name</th><th>cmd</th><th>age</th><th>idle</th><th>flags</th><th>db</th><th>mem</th></tr></thead>
+          <tbody>${clients.map(c => `<tr>
+            <td style="color:var(--text3)">${e(c.id||'—')}</td>
+            <td style="color:var(--cyan)">${e(c.addr||'—')}</td>
+            <td style="color:var(--text2)">${e(c.name||'—')}</td>
+            <td style="color:var(--accent)">${e(c.cmd||'—')}</td>
+            <td>${e(c.age||'0')}s</td>
+            <td>${e(c.idle||'0')}s</td>
+            <td style="color:var(--yellow)">${e(c.flags||'—')}</td>
+            <td>${e(c.db||'0')}</td>
+            <td>${formatBytes(parseInt(c.tot_mem || c.mem || c.rbs || '0'))}</td>
+          </tr>`).join('')}</tbody>
+        </table>
+      </div>`;
+  } catch (err) {
+    el.innerHTML = `<div style="color:var(--red);padding:16px">Failed to load clients: ${e(String(err))}</div>`;
+  }
 }
 
 // ─── Slow Log ────────────────────────────────────────────────────────────────
 async function loadSlowlog() {
-  document.getElementById('slowlogContent').innerHTML = `<div class="loading-overlay"><div class="spinner"></div></div>`;
-  const res = await api('slowlog');
-  if (!res.ok) { document.getElementById('slowlogContent').innerHTML = `<div style="color:var(--red)">Not available</div>`; return; }
-  const entries = res.slowlog || [];
-  if (!entries.length || !Array.isArray(entries)) {
-    document.getElementById('slowlogContent').innerHTML = `<div style="color:var(--text3);margin-top:16px">No slow log entries. Commands must exceed the slowlog-log-slower-than threshold.</div>`; return;
+  const el = document.getElementById('slowlogContent');
+  el.innerHTML = `<div class="loading-overlay"><div class="spinner"></div></div>`;
+  try {
+    const res = await api('slowlog');
+    if (!res.ok) { el.innerHTML = `<div style="color:var(--red);padding:16px">Not available</div>`; return; }
+    const entries = res.slowlog;
+    if (!Array.isArray(entries) || !entries.length) {
+      el.innerHTML = `<div style="color:var(--text3);padding:16px">No slow log entries. Threshold: set <code>slowlog-log-slower-than</code> to a value in microseconds.</div>`; return;
+    }
+    el.innerHTML = entries.map(entry => {
+      if (!Array.isArray(entry)) return '';
+      const [id, ts, micros, args] = entry;
+      const cmd = Array.isArray(args) ? args.map(String).join(' ') : String(args || '');
+      const ms = (parseInt(micros || 0) / 1000).toFixed(2);
+      const time = ts ? new Date(ts * 1000).toLocaleString() : '—';
+      return `<div class="slowlog-entry">
+        <div class="slowlog-cmd">${e(cmd)}</div>
+        <div class="slowlog-meta">
+          <span>ID: <span>${id}</span></span>
+          <span>Duration: <span>${ms}ms</span></span>
+          <span>Time: <span>${time}</span></span>
+        </div>
+      </div>`;
+    }).join('');
+  } catch (err) {
+    el.innerHTML = `<div style="color:var(--red);padding:16px">Failed to load slow log: ${e(String(err))}</div>`;
   }
-  document.getElementById('slowlogContent').innerHTML = entries.map(entry => {
-    const [id, ts, micros, args] = entry;
-    const cmd = Array.isArray(args) ? args.join(' ') : String(args||'');
-    const ms = (micros/1000).toFixed(2);
-    return `<div class="slowlog-entry">
-      <div class="slowlog-cmd">${e(cmd)}</div>
-      <div class="slowlog-meta">
-        <span>ID: <span>${id}</span></span>
-        <span>Duration: <span>${ms}ms</span></span>
-        <span>Time: <span>${new Date(ts*1000).toLocaleString()}</span></span>
-      </div>
-    </div>`;
-  }).join('');
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 async function loadConfig() {
-  document.getElementById('configContent').innerHTML = `<div class="loading-overlay"><div class="spinner"></div></div>`;
-  const res = await api('config_get');
-  if (!res.ok) { document.getElementById('configContent').innerHTML = `<div style="color:var(--red)">Cannot load config</div>`; return; }
-  const cfg = res.config;
-  const rows = Object.entries(cfg).map(([k,v]) => `<tr><td>${e(k)}</td><td>${e(v||'(empty)')}</td></tr>`).join('');
-  document.getElementById('configContent').innerHTML = `
-    <div style="margin-top:12px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
-      <table class="config-table"><tbody>${rows}</tbody></table>
-    </div>`;
+  const el = document.getElementById('configContent');
+  el.innerHTML = `<div class="loading-overlay"><div class="spinner"></div></div>`;
+  try {
+    const res = await api('config_get');
+    if (!res.ok) { el.innerHTML = `<div style="color:var(--red);padding:16px">Cannot load config (may require elevated privileges)</div>`; return; }
+    const cfg = res.config;
+    if (!cfg || !Object.keys(cfg).length) {
+      el.innerHTML = `<div style="color:var(--text3);padding:16px">No configuration returned.</div>`; return;
+    }
+    const rows = Object.entries(cfg).map(([k, v]) => `<tr><td>${e(k)}</td><td>${e(v || '(empty)')}</td></tr>`).join('');
+    el.innerHTML = `
+      <div style="margin-top:12px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
+        <table class="config-table"><tbody>${rows}</tbody></table>
+      </div>`;
+  } catch (err) {
+    el.innerHTML = `<div style="color:var(--red);padding:16px">Failed to load config: ${e(String(err))}</div>`;
+  }
 }
 
 // ─── Init ────────────────────────────────────────────────────────────────────
