@@ -400,6 +400,7 @@ if (isset($_GET['ajax'])) {
         case 'select_db':
             $db = (int)pget('db', 0);
             $_SESSION['redis_conn']['db'] = $db;
+            session_write_close();
             echo j(['ok' => true]); break;
 
         case 'server_info':
@@ -1633,11 +1634,11 @@ const S = {
 };
 
 // ─── API ─────────────────────────────────────────────────────────────────────
-async function api(action, data = {}) {
+async function api(action, data = {}, signal) {
   const fd = new FormData();
   fd.append('action', action);
   for (const [k, v] of Object.entries(data)) fd.append(k, v);
-  const res = await fetch('?ajax=1', { method: 'POST', body: fd });
+  const res = await fetch('?ajax=1', { method: 'POST', body: fd, signal });
   return res.json();
 }
 
@@ -1687,17 +1688,24 @@ async function switchDb(db) {
 }
 
 // ─── Keys Loading ─────────────────────────────────────────────────────────────
+let _loadKeysAbort = null;
 async function loadKeys(page) {
+  _loadKeysAbort?.abort();
+  _loadKeysAbort = new AbortController();
   if (page === undefined) page = 0;
   S.page = page;
   S.pattern = document.getElementById('keySearch').value || '*';
   const list = document.getElementById('keysList');
   list.innerHTML = `<div class="loading-overlay"><div class="spinner"></div> Scanning…</div>`;
-  const res = await api('keys', { pattern: S.pattern, type: S.typeFilter, page });
-  if (!res.ok) { toast(res.error, 'error'); return; }
-  S.keys = res.keys; S.total = res.total;
-  renderKeys(res.keys, res.total, page, res.per_page);
-  updateTopbarDbSize();
+  try {
+    const res = await api('keys', { pattern: S.pattern, type: S.typeFilter, page }, _loadKeysAbort.signal);
+    if (!res.ok) { toast(res.error, 'error'); return; }
+    S.keys = res.keys; S.total = res.total;
+    renderKeys(res.keys, res.total, page, res.per_page);
+    updateTopbarDbSize();
+  } catch (e) {
+    if (e.name !== 'AbortError') toast('Failed to load keys', 'error');
+  }
 }
 
 // ─── Prefix Tree ─────────────────────────────────────────────────────────────
